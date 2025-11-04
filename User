@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# create-repo-and-push.sh
+# Helper: creates repo with gh, commits and pushes files, then applies branch protection via API.
+# Requirements: gh CLI (authenticated), jq, curl, a GITHUB_TOKEN with repo scope set in environment to apply protection.
+set -euo pipefail
+
+OWNER="corintiaalison-pixel"
+REPO="block-links-modal"
+BRANCH="main"
+VISIBILITY="public"
+
+echo "Creating repo $OWNER/$REPO (if it doesn't exist)..."
+gh repo create "$OWNER/$REPO" --"$VISIBILITY" --license "GPL-3.0" --confirm || {
+  echo "Repo may already exist or gh failed; continuing..."
+}
+
+if [ ! -d .git ]; then
+  git init -b "$BRANCH"
+fi
+
+git remote remove origin 2>/dev/null || true
+git remote add origin "git@github.com:$OWNER/$REPO.git" || true
+
+git add .
+git commit -m "Initial commit: block-links-modal + security-scan + CODEOWNERS + LICENSE" || true
+git branch -M "$BRANCH"
+git push -u origin "$BRANCH"
+
+echo "If you want branch protection applied now, export GITHUB_TOKEN with repo scope and press Enter, otherwise Ctrl+C to skip."
+read -r
+
+if [ -z "${GITHUB_TOKEN:-}" ]; then
+  echo "GITHUB_TOKEN not set; skipping protection."
+  exit 0
+fi
+
+PROTECTION_API="https://api.github.com/repos/$OWNER/$REPO/branches/$BRANCH/protection"
+
+cat > /tmp/protection.json <<'JSON'
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": ["security-scan"]
+  },
+  "enforce_admins": false,
+  "required_pull_request_reviews": {
+    "dismiss_stale_reviews": true,
+    "require_code_owner_reviews": true,
+    "required_approving_review_count": 2
+  },
+  "restrictions": {
+    "users": ["corintiaalison-pixel"],
+    "teams": []
+  }
+}
+JSON
+
+curl -sS -X PUT -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
+  "$PROTECTION_API" -d @/tmp/protection.json | jq .
+
+echo "Branch protection applied (or API response shown)."
