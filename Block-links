@@ -1,0 +1,486 @@
+// assets/js/block-links-modal.js
+// Evita duplicados, bloquea ejecución de JavaScript inline, evita sitios .llc y autoinicia.
+// Además ejecuta restoreSecurity() automáticamente al inicializar.
+// Licence: GPL-3.0
+(function () {
+  'use strict';
+
+  if (!window._blm_instances) window._blm_instances = {};
+
+  const INSTANCE_KEY = 'default';
+  const STYLE_ID = 'blm-styles';
+  const OVERLAY_ID_PREFIX = 'blm-overlay-';
+  const defaultSelector = 'a.Duplicate';
+  const focusableSelectors = [
+    'a[href]',
+    'area[href]',
+    'input:not([disabled]):not([type="hidden"])',
+    'select:not([disabled])',
+    'textarea:not([disabled])',
+    'button:not([disabled])',
+    'iframe',
+    'object',
+    'embed',
+    '[contenteditable]',
+    '[tabindex]:not([tabindex^="-"])'
+  ].join(',');
+
+  function createElement(tag, attrs = {}, children = []) {
+    const el = document.createElement(tag);
+    Object.keys(attrs).forEach(k => {
+      if (k === 'className') el.className = attrs[k];
+      else if (k === 'text') el.textContent = attrs[k];
+      else el.setAttribute(k, attrs[k]);
+    });
+    children.forEach(c => el.appendChild(c));
+    return el;
+  }
+
+  function ensureStyles() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent = `
+.blm-overlay {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.5);
+  z-index: 9999;
+}
+.blm-overlay[aria-hidden="false"] {
+  display: flex;
+}
+.blm-modal {
+  background: #fff;
+  color: #111;
+  max-width: 520px;
+  width: calc(100% - 32px);
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+}
+.blm-modal h2 { margin: 0 0 8px 0; font-size: 1.125rem; }
+.blm-modal p { margin: 0 0 16px 0; line-height: 1.4; }
+.blm-buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+.blm-continue { background: #1a73e8; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; }
+.blm-close { background: transparent; color: #333; border: 1px solid #ccc; padding: 8px 12px; border-radius: 4px; cursor: pointer; }
+.blm-continue:focus, .blm-close:focus { outline: 3px solid rgba(26,115,232,0.3); outline-offset: 2px; }
+a.blm-blocked-llc { pointer-events: none; opacity: 0.6; cursor: not-allowed; }
+a.blm-js-blocked { pointer-events: none; opacity: 0.7; cursor: not-allowed; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function buildModalParts({ titleText, messageText, continueLabel = 'Continuar de todos modos', closeLabel = 'Cerrar' }, uid) {
+    ensureStyles();
+
+    const overlayId = OVERLAY_ID_PREFIX + uid;
+    let existing = document.getElementById(overlayId);
+    if (existing) {
+      const modal = existing.querySelector('.blm-modal');
+      return {
+        overlay: existing,
+        modal: modal,
+        continueBtn: modal.querySelector('.blm-continue'),
+        closeBtn: modal.querySelector('.blm-close'),
+        title: modal.querySelector('h2'),
+        desc: modal.querySelector('p')
+      };
+    }
+
+    const overlay = createElement('div', { className: 'blm-overlay', 'aria-hidden': 'true', id: overlayId });
+
+    const modal = createElement('div', { className: 'blm-modal', role: 'dialog', 'aria-modal': 'true' });
+    const titleId = 'blm-modal-title-' + uid;
+    const descId = 'blm-modal-desc-' + uid;
+    modal.setAttribute('aria-labelledby', titleId);
+    modal.setAttribute('aria-describedby', descId);
+
+    const title = createElement('h2', { id: titleId, text: titleText || 'Control privado' });
+    const desc = createElement('p', { id: descId, text: messageText || 'Este recurso está restringido. ¿Deseas continuar de todos modos?' });
+
+    const btnContainer = createElement('div', { className: 'blm-buttons' });
+    const continueBtn = createElement('button', { className: 'blm-continue', type: 'button', text: continueLabel });
+    const closeBtn = createElement('button', { className: 'blm-close', type: 'button', text: closeLabel });
+
+    btnContainer.appendChild(continueBtn);
+    btnContainer.appendChild(closeBtn);
+
+    modal.appendChild(title);
+    modal.appendChild(desc);
+    modal.appendChild(btnContainer);
+
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    return { overlay, modal, continueBtn, closeBtn, title, desc };
+  }
+
+  function getFocusable(container) {
+    return Array.from(container.querySelectorAll(focusableSelectors))
+      .filter(el => el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length);
+  }
+
+  function trapFocus(modalEl) {
+    let focusables = getFocusable(modalEl);
+    let first = focusables[0] || modalEl;
+    let last = focusables[focusables.length - 1] || modalEl;
+
+    function onKeyDown(e) {
+      if (e.key === 'Tab') {
+        if (focusables.length === 0) {
+          e.preventDefault();
+          return;
+        }
+        if (e.shiftKey) {
+          if (document.activeElement === first || document.activeElement === modalEl) {
+            e.preventDefault();
+            last.focus();
+          }
+        } else {
+          if (document.activeElement === last) {
+            e.preventDefault();
+            first.focus();
+          }
+        }
+      }
+    }
+
+    document.addEventListener('keydown', onKeyDown);
+    return function release() {
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }
+
+  function setBackgroundInert(overlayEl, inert = true) {
+    const bodyChildren = Array.from(document.body.children || []);
+    bodyChildren.forEach(child => {
+      if (child === overlayEl) return;
+      try {
+        if (inert) {
+          child.setAttribute('aria-hidden', 'true');
+          if ('inert' in child) child.inert = true;
+        } else {
+          child.removeAttribute('aria-hidden');
+          if ('inert' in child) child.inert = false;
+        }
+      } catch (err) { /* ignore */ }
+    });
+  }
+
+  function isJavaScriptHref(href) {
+    if (!href) return false;
+    try {
+      const s = href.trim().toLowerCase();
+      return s.startsWith('javascript:');
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function isLLCDomain(href) {
+    if (!href) return false;
+    try {
+      const url = new URL(href, window.location.href);
+      const hn = (url.hostname || '').toLowerCase();
+      return hn.endsWith('.llc');
+    } catch (err) {
+      try {
+        const s = href.toLowerCase();
+        return s.indexOf('.llc') !== -1;
+      } catch (e) {
+        return false;
+      }
+    }
+  }
+
+  function restoreSecurity(scanOptions = {}) {
+    const { neutralizeJSlinks = true, blockLLC = true } = scanOptions;
+    const results = { jsBlocked: 0, llcBlocked: 0, onclickRemoved: 0 };
+
+    document.querySelectorAll('a[href]').forEach(a => {
+      try {
+        const href = a.getAttribute('href') || '';
+        const hasOnclick = a.hasAttribute('onclick');
+
+        if (neutralizeJSlinks && isJavaScriptHref(href)) {
+          a.setAttribute('data-original-href', href);
+          a.setAttribute('href', '#');
+          a.classList.add('blm-js-blocked');
+          a.setAttribute('aria-disabled', 'true');
+          a.tabIndex = -1;
+          results.jsBlocked++;
+        }
+
+        if (blockLLC && isLLCDomain(href)) {
+          a.setAttribute('data-original-href', href);
+          a.classList.add('blm-blocked-llc');
+          a.setAttribute('aria-disabled', 'true');
+          a.tabIndex = -1;
+          results.llcBlocked++;
+        }
+
+        if (hasOnclick) {
+          try {
+            const fn = a.getAttribute('onclick');
+            a.setAttribute('data-onclick-backup', fn);
+            a.removeAttribute('onclick');
+            results.onclickRemoved++;
+          } catch (err) { /* ignore */ }
+        }
+      } catch (err) { /* ignore element */ }
+    });
+
+    console.info('blm.restoreSecurity results:', results);
+    return results;
+  }
+
+  function initBlockLinksWithModal(options = {}) {
+    const force = !!options.force;
+    if (window._blm_instances[INSTANCE_KEY] && !force) {
+      return window._blm_instances[INSTANCE_KEY];
+    }
+
+    const selector = options.selector || defaultSelector;
+    const titleText = options.title || options.titleText || 'Control privado';
+    const messageText = options.message || options.messageText || 'Este recurso está restringido. ¿Deseas continuar de todos modos?';
+    const continueLabel = options.continueLabel || 'Continuar de todos modos';
+    const closeLabel = options.closeLabel || 'Cerrar';
+    const autoInit = options.autoInit !== undefined ? !!options.autoInit : true;
+    const autoRunRestore = options.autoRunRestore !== undefined ? !!options.autoRunRestore : true;
+
+    const uid = String(Date.now()) + Math.floor(Math.random() * 10000);
+    const { overlay, modal, continueBtn, closeBtn, title, desc } = buildModalParts({ titleText, messageText, continueLabel, closeLabel }, uid);
+
+    let releaseFocusTrap = null;
+    let previouslyFocused = null;
+    let lastActivation = null;
+
+    function openModalFor(link, activationEvent, meta = {}) {
+      lastActivation = { link, event: activationEvent || null, isLLC: !!meta.isLLC, isJS: !!meta.isJS };
+      previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+      if (lastActivation.isLLC) {
+        title.textContent = titleText || 'Control privado';
+        desc.textContent = 'Este enlace apunta a un dominio .llc y está bloqueado por razones de seguridad.';
+        continueBtn.setAttribute('disabled', 'true');
+      } else if (lastActivation.isJS) {
+        title.textContent = titleText || 'Control privado';
+        desc.textContent = 'Este enlace intentaba ejecutar JavaScript inline y fue neutralizado.';
+        continueBtn.setAttribute('disabled', 'true');
+      } else {
+        title.textContent = titleText || 'Control privado';
+        desc.textContent = messageText || 'Este recurso está restringido. ¿Deseas continuar de todos modos?';
+        continueBtn.removeAttribute('disabled');
+      }
+
+      overlay.setAttribute('aria-hidden', 'false');
+      setBackgroundInert(overlay, true);
+
+      const focusables = getFocusable(modal);
+      if (focusables.length) focusables[0].focus();
+      else {
+        modal.setAttribute('tabindex', '-1');
+        modal.focus();
+      }
+
+      releaseFocusTrap = trapFocus(modal);
+      document.addEventListener('keydown', onDocumentKeyDown, true);
+    }
+
+    function closeModal() {
+      overlay.setAttribute('aria-hidden', 'true');
+      setBackgroundInert(overlay, false);
+      if (releaseFocusTrap) { releaseFocusTrap(); releaseFocusTrap = null; }
+      document.removeEventListener('keydown', onDocumentKeyDown, true);
+      if (previouslyFocused && previouslyFocused.focus) previouslyFocused.focus();
+      else document.body.focus();
+      lastActivation = null;
+      title.textContent = titleText || 'Control privado';
+      desc.textContent = messageText || 'Este recurso está restringido. ¿Deseas continuar de todos modos?';
+      continueBtn.removeAttribute('disabled');
+    }
+
+    function onDocumentKeyDown(e) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeModal();
+      }
+    }
+
+    function continueToLink() {
+      if (!lastActivation || !lastActivation.link) { closeModal(); return; }
+      const link = lastActivation.link;
+      const originalEvent = lastActivation.event;
+
+      if (lastActivation.isJS || lastActivation.isLLC) {
+        console.warn('Navegación bloqueada por política de seguridad (JS inline o .llc).', link);
+        closeModal();
+        return;
+      }
+
+      closeModal();
+
+      const shouldOpenInNewTab =
+        (originalEvent && ((originalEvent.ctrlKey || originalEvent.metaKey || originalEvent.button === 1))) ||
+        (link.target && link.target === '_blank');
+
+      try {
+        if (shouldOpenInNewTab) {
+          window.open(link.href, '_blank', 'noopener');
+        } else {
+          window.location.href = link.href;
+        }
+      } catch (err) {
+        window.location.href = link.href;
+      }
+    }
+
+    function findLink(target) {
+      return target && target.closest ? target.closest(selector) : null;
+    }
+
+    function handleActivationCapture(e) {
+      const link = findLink(e.target);
+      if (!link) return;
+      if (link.hasAttribute('data-allow')) return;
+
+      const href = link.getAttribute('href') || link.href || '';
+      const meta = { isJS: isJavaScriptHref(href), isLLC: isLLCDomain(href) };
+
+      if (meta.isJS) {
+        try {
+          link.setAttribute('data-original-href', href);
+          link.setAttribute('href', '#');
+          link.classList.add('blm-js-blocked');
+          link.setAttribute('aria-disabled', 'true');
+          link.tabIndex = -1;
+        } catch (err) { /* ignore */ }
+      }
+
+      if (meta.isLLC) {
+        try {
+          link.setAttribute('data-original-href', href);
+          link.classList.add('blm-blocked-llc');
+          link.setAttribute('aria-disabled', 'true');
+          link.tabIndex = -1;
+        } catch (err) { /* ignore */ }
+      }
+
+      e.preventDefault();
+      try { e.stopImmediatePropagation(); } catch (err) { e.stopPropagation(); }
+      openModalFor(link, e, meta);
+    }
+
+    function handleAuxClickCapture(e) {
+      const link = findLink(e.target);
+      if (!link) return;
+      if (link.hasAttribute('data-allow')) return;
+      e.preventDefault();
+      try { e.stopImmediatePropagation(); } catch (err) { e.stopPropagation(); }
+      const href = link.getAttribute('href') || link.href || '';
+      const meta = { isJS: isJavaScriptHref(href), isLLC: isLLCDomain(href) };
+      openModalFor(link, e, meta);
+    }
+
+    function onKeyDownCapture(e) {
+      const active = document.activeElement;
+      const link = active && active.matches ? (active.matches(selector) ? active : active.closest ? active.closest(selector) : null) : null;
+      if (!link) return;
+      if (link.hasAttribute('data-allow')) return;
+      const isEnter = e.key === 'Enter';
+      const isSpace = e.key === ' ' || e.key === 'Spacebar' || e.code === 'Space';
+      if (isEnter || isSpace) {
+        e.preventDefault();
+        try { e.stopImmediatePropagation(); } catch (err) { e.stopPropagation(); }
+        const href = link.getAttribute('href') || link.href || '';
+        const meta = { isJS: isJavaScriptHref(href), isLLC: isLLCDomain(href) };
+        openModalFor(link, e, meta);
+      }
+    }
+
+    document.addEventListener('click', handleActivationCapture, true);
+    document.addEventListener('auxclick', handleAuxClickCapture, true);
+    document.addEventListener('keydown', onKeyDownCapture, true);
+
+    continueBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      continueToLink();
+    });
+
+    closeBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      closeModal();
+    });
+
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay) closeModal();
+    });
+
+    function stop() {
+      document.removeEventListener('click', handleActivationCapture, true);
+      document.removeEventListener('auxclick', handleAuxClickCapture, true);
+      document.removeEventListener('keydown', onKeyDownCapture, true);
+      document.removeEventListener('keydown', onDocumentKeyDown, true);
+      if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+      const style = document.getElementById(STYLE_ID);
+      if (style && style.parentNode) style.parentNode.removeChild(style);
+      setBackgroundInert(overlay, false);
+      delete window._blm_instances[INSTANCE_KEY];
+    }
+
+    const controller = { stop, options: { selector, titleText, messageText } };
+    window._blm_instances[INSTANCE_KEY] = controller;
+
+    if (!window.blmUtils) window.blmUtils = {};
+    window.blmUtils.restoreSecurity = restoreSecurity;
+    window.blmUtils.isJavaScriptHref = isJavaScriptHref;
+    window.blmUtils.isLLCDomain = isLLCDomain;
+
+    if (autoRunRestore) {
+      try {
+        restoreSecurity({ neutralizeJSlinks: true, blockLLC: true });
+      } catch (err) {
+        console.error('blm: restoreSecurity failed', err);
+      }
+    }
+
+    return controller;
+  }
+
+  window.initBlockLinksWithModal = initBlockLinksWithModal;
+
+  if (!window._blm_instances[INSTANCE_KEY]) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => {
+        try {
+          window._blm_instances[INSTANCE_KEY] = initBlockLinksWithModal({
+            selector: defaultSelector,
+            title: 'Control privado',
+            message: 'Este recurso está restringido. ¿Deseas continuar de todos modos?',
+            autoInit: true,
+            autoRunRestore: true
+          });
+        } catch (err) {
+          console.error('blm: init failed', err);
+        }
+      });
+    } else {
+      try {
+        window._blm_instances[INSTANCE_KEY] = initBlockLinksWithModal({
+          selector: defaultSelector,
+          title: 'Control privado',
+          message: 'Este recurso está restringido. ¿Deseas continuar de todos modos?',
+          autoInit: true,
+          autoRunRestore: true
+        });
+      } catch (err) {
+        console.error('blm: init failed', err);
+      }
+    }
+  }
+
+})();
